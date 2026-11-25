@@ -140,3 +140,24 @@ async def test_layout_records(fake_malcolm, clear_records):
     assert records["PULSE1:LAYOUT:VISIBLE"].record.get() == 0
 
     await client.close()
+
+
+async def test_layout_client_concurrent_puts_to_same_block(fake_malcolm):
+    """Puts that overlap, e.g. caput to X then Y in quick succession, must not
+    overwrite each other with stale values from the cached table"""
+    malcolm, port = fake_malcolm
+    client = MalcolmLayoutClient("localhost", port)
+    await client.connect()
+    client.start()
+    try:
+        await asyncio.gather(
+            client.put("PCAP", x=1.0),
+            client.put("PCAP", y=2.0),
+            client.put("PCAP", visible=True),
+        )
+        index = malcolm.table["name"].index("PCAP")
+        assert malcolm.table["x"][index] == 1.0
+        assert malcolm.table["y"][index] == 2.0
+        assert malcolm.table["visible"][index] is True
+    finally:
+        await client.close()

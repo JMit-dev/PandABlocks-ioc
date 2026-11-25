@@ -38,6 +38,9 @@ class MalcolmLayoutClient:
         self._next_id = _SUBSCRIBE_ID + 1
         self._pending: dict[int, asyncio.Future] = {}
         self._task: asyncio.Task | None = None
+        # Each put sends a whole row built from the cached table, so they must not
+        # overlap or a later put would revert an earlier one
+        self._put_lock = asyncio.Lock()
         self.table: LayoutTable = {}
         self.on_update: Callable[[LayoutTable], None] | None = None
 
@@ -81,35 +84,42 @@ class MalcolmLayoutClient:
     async def put(self, name: str, **changes: Any) -> None:
         """Change one or more columns (`x`, `y`, `visible`) of the row for block
         instance `name`, leaving every other row untouched."""
-        if self._ws is None:
-            raise MalcolmError("Not connected to Malcolm")
+        async with self._put_lock:
+            if self._ws is None:
+                raise MalcolmError("Not connected to Malcolm")
 
-        index = self.table["name"].index(name)
-        value = {
-            column: [values[index]] if isinstance(values, list) else values
-            for column, values in self.table.items()
-        }
-        for column, new_value in changes.items():
-            value[column] = [new_value]
+            index = self.table["name"].index(name)
+            value = {
+                column: [values[index]] if isinstance(values, list) else values
+                for column, values in self.table.items()
+            }
+            for column, new_value in changes.items():
+                value[column] = [new_value]
 
-        msg_id = self._next_id
-        self._next_id += 1
-        future = asyncio.get_running_loop().create_future()
-        self._pending[msg_id] = future
-        try:
-            await self._ws.send(
-                json.dumps(
-                    {
-                        "typeid": "malcolm:core/Put:1.0",
-                        "id": msg_id,
-                        "path": LAYOUT_PATH,
-                        "value": value,
-                    }
+            msg_id = self._next_id
+            self._next_id += 1
+            future = asyncio.get_running_loop().create_future()
+            self._pending[msg_id] = future
+            try:
+                await self._ws.send(
+                    json.dumps(
+                        {
+                            "typeid": "malcolm:core/Put:1.0",
+                            "id": msg_id,
+                            "path": LAYOUT_PATH,
+                            "value": value,
+                        }
+                    )
                 )
-            )
-            await asyncio.wait_for(future, self._timeout)
-        finally:
-            self._pending.pop(msg_id, None)
+                await asyncio.wait_for(future, self._timeout)
+            finally:
+                self._pending.pop(msg_id, None)
+
+            # The subscription update for this put may not have arrived yet, so
+            # apply it to the cache now for the next put to build on
+            index = self.table["name"].index(name)
+            for column, new_value in changes.items():
+                self.table[column][index] = new_value
 
     def _handle_message(self, message: dict) -> None:
         typeid = message.get("typeid")
