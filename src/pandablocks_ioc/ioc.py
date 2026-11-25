@@ -20,6 +20,7 @@ from pandablocks.commands import (
     GetFieldInfo,
     Put,
 )
+from pandablocks.connections import ControlConnection
 from pandablocks.responses import (
     BitMuxFieldInfo,
     BitOutFieldInfo,
@@ -2018,6 +2019,27 @@ async def create_records(
     return (all_records, all_values_dict, block_info_dict)
 
 
+def _reset_client_state(client: AsyncioClient):
+    """Discard any command/response state left over from a previous connection.
+
+    AsyncioClient keeps the queue of commands awaiting a response across
+    connections, so a command that was in flight when the connection dropped
+    would be matched against the first response on the new connection, and the
+    Identify sent by connect() would never complete.
+    TODO: Remove once AsyncioClient.connect() resets this state itself.
+    """
+    client._ctrl_connection = ControlConnection()
+    client._ctrl_queues.clear()
+
+
+async def _close_client(client: AsyncioClient):
+    """Close the client, ignoring errors from an already broken connection"""
+    try:
+        await client.close()
+    except Exception:
+        logging.debug("Error closing connection to PandA", exc_info=True)
+
+
 async def _reconnect_client(
     client: AsyncioClient,
     connection_status: ConnectionStatus,
@@ -2037,6 +2059,7 @@ async def _reconnect_client(
     while True:
         await asyncio.sleep(retry_delay)
         connection_status.set_status(Statuses.CONNECTING)
+        _reset_client_state(client)
         try:
             await client.connect()
             logging.info("Reconnected to PandA successfully")
@@ -2044,11 +2067,13 @@ async def _reconnect_client(
             set_all_records_severity(all_records, alarm.NO_ALARM, alarm.UDF_ALARM)
             return
         except OSError:
+            # connect() may have opened the socket before failing on Identify
+            await _close_client(client)
+            retry_delay = min(retry_delay * 2, max_retry_delay)
             logging.warning(
                 f"Reconnection attempt failed, retrying in {retry_delay:.1f}s"
             )
             connection_status.set_status(Statuses.DISCONNECTED)
-            retry_delay = min(retry_delay * 2, max_retry_delay)
 
 
 async def update(
@@ -2092,8 +2117,7 @@ async def update(
                     "PandA communication error. "
                     "Setting all records to major alarm state and reconnecting."
                 )
-                if client.is_connected():
-                    await client.close()
+                await _close_client(client)
                 await _reconnect_client(
                     client, connection_status, all_records, poll_period
                 )
@@ -2224,8 +2248,7 @@ async def update(
                 "Connection error while processing updates from PandA. "
                 "Attempting reconnection."
             )
-            if client.is_connected():
-                await client.close()
+            await _close_client(client)
             await _reconnect_client(client, connection_status, all_records, poll_period)
             continue
         except Exception:

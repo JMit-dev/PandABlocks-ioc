@@ -1,12 +1,13 @@
 import asyncio
 import logging
+import re
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from mock.mock import MagicMock, call
 from pandablocks.asyncio import AsyncioClient
-from pandablocks.commands import Put
+from pandablocks.commands import ChangeGroup, GetChanges, Identify, Put
 from pandablocks.responses import (
     BitMuxFieldInfo,
     BitOutFieldInfo,
@@ -38,6 +39,7 @@ from pandablocks_ioc._types import (
 from pandablocks_ioc.ioc import (
     IocRecordFactory,
     StringRecordLabelValidator,
+    _close_client,
     _reconnect_client,
     _RecordUpdater,
     _TimeRecordUpdater,
@@ -990,8 +992,9 @@ async def test_update_reconnects_on_connection_lost():
     assert Statuses.CONNECTED in mock_connection_status.statuses_set
 
 
-async def test_update_reconnects_on_oserror_during_processing():
-    """Test that an OSError outside the inner try/except triggers reconnection"""
+async def test_update_does_not_reconnect_on_non_oserror():
+    """Test that an error during processing that is not an OSError is logged
+    and the update loop continues without reconnecting"""
     client = AsyncioClient("123")
     client.is_connected = MagicMock(return_value=False)  # type: ignore
     client.close = AsyncMock()  # type: ignore
@@ -1043,16 +1046,17 @@ async def test_update_reconnects_on_oserror_during_processing():
 
 
 async def test_reconnect_exponential_backoff_caps_at_max(caplog):
-    """Test that reconnection backoff is capped at 60 seconds"""
+    """Test that the reconnection delay doubles each attempt up to 60 seconds,
+    and that the logged delay matches the delay actually waited"""
     caplog.set_level(logging.WARNING)
 
     client = AsyncioClient("123")
-    # Fail a few times to test backoff, then succeed
+    # Fail five times, then succeed
     attempts = []
 
     async def mock_connect():
         attempts.append(1)
-        if len(attempts) < 5:
+        if len(attempts) <= 5:
             raise OSError("refused")
 
     client.connect = mock_connect  # type: ignore
@@ -1067,18 +1071,81 @@ async def test_reconnect_exponential_backoff_caps_at_max(caplog):
 
     mock_connection_status = MockConnectionStatus()
 
-    # Use a short poll_period so the test doesn't take too long
-    await asyncio.wait_for(
-        _reconnect_client(client, mock_connection_status, all_records, 0.01),
-        timeout=2.0,
-    )
+    with patch("pandablocks_ioc.ioc.asyncio.sleep", new=AsyncMock()) as mock_sleep:
+        await _reconnect_client(client, mock_connection_status, all_records, 10.0)
 
-    assert len(attempts) == 5
-    # Verify exponential backoff is mentioned in logs
-    assert "Reconnection attempt failed" in caplog.text
-    # Verify delays are increasing in the log messages
-    assert "retrying in 0.0s" in caplog.text
-    assert "retrying in 0.0s" in caplog.text
+    assert len(attempts) == 6
+    delays = [c.args[0] for c in mock_sleep.call_args_list]
+    assert delays == [10.0, 20.0, 40.0, 60.0, 60.0, 60.0]
+    logged = re.findall(r"retrying in ([0-9.]+)s", caplog.text)
+    assert [float(d) for d in logged] == delays[1:]
+
+
+class FakeControlPort:
+    """Minimal PandA control port that answers *IDN?, and can be told to drop the
+    connection instead of answering the next command"""
+
+    IDN = b"OK =PandA SW: 4.0 FPGA: 4.0.0 05b15630 0a2b0249 rootfs: PandA 4.0\n"
+
+    def __init__(self):
+        self.drop_next_command = False
+        self.writers: list[asyncio.StreamWriter] = []
+
+    async def handler(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        self.writers.append(writer)
+        while line := await reader.readline():
+            if self.drop_next_command:
+                self.drop_next_command = False
+                writer.close()
+                return
+            if line.strip() == b"*IDN?":
+                writer.write(self.IDN)
+                await writer.drain()
+
+
+async def test_reconnect_after_connection_dropped_mid_command():
+    """Test that a real AsyncioClient reconnects when the connection drops while a
+    command is still awaiting its response, as happens when a PandA reboots"""
+    fake_panda = FakeControlPort()
+    server = await asyncio.start_server(fake_panda.handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+
+    client = AsyncioClient("127.0.0.1")
+    # AsyncioClient always uses port 8888, redirect it to the fake PandA
+    connect_stream = client._ctrl_stream.connect
+    client._ctrl_stream.connect = lambda host, _: connect_stream(host, port)  # type: ignore
+
+    class MockConnectionStatus:
+        statuses_set = []
+        set_status = statuses_set.append
+
+    mock_connection_status = MockConnectionStatus()
+
+    try:
+        await client.connect()
+
+        fake_panda.drop_next_command = True
+        with pytest.raises(OSError):
+            await client.send(GetChanges(ChangeGroup.ALL, True), timeout=0.5)
+
+        # As update() does before reconnecting
+        await _close_client(client)
+        await asyncio.wait_for(
+            _reconnect_client(client, mock_connection_status, {}, 0.01), timeout=5
+        )
+        assert mock_connection_status.statuses_set[-1] == Statuses.CONNECTED
+
+        # The new connection must be usable, not just open
+        identification = await client.send(Identify(), timeout=1)
+        assert identification.software == "4.0"
+    finally:
+        await _close_client(client)
+        for writer in fake_panda.writers:
+            writer.close()
+        server.close()
+        await server.wait_closed()
+        # Let the fake PandA's handlers see the closed connections and exit
+        await asyncio.sleep(0.1)
 
 
 @pytest.mark.parametrize(
