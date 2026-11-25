@@ -319,6 +319,11 @@ def extract_label_from_metadata(block_name_number, field_name: str):
     return None
 
 
+def _is_metadata(field: str) -> bool:
+    """Whether the (PandA or EPICS style) field name is a *METADATA field"""
+    return field.startswith("*METADATA")
+
+
 def _create_dicts_from_changes(
     changes: Changes, block_info_dict: dict[str, BlockInfo]
 ) -> tuple[dict[str, dict[EpicsName, RecordValue]], dict[EpicsName, RecordValue]]:
@@ -2239,9 +2244,15 @@ async def update(
                         field = block_label
 
                 if field not in all_records:
-                    logging.error(
-                        f"Unknown field {field} returned from GetChanges values"
-                    )
+                    if _is_metadata(field) and not block_label:
+                        # Metadata such as *METADATA.DESIGN has no record. It is
+                        # reported after every reconnection, as a new connection
+                        # gets every value in its first GetChanges
+                        logging.debug(f"Ignoring {field} returned from GetChanges")
+                    else:
+                        logging.error(
+                            f"Unknown field {field} returned from GetChanges values"
+                        )
                     continue
 
                 record_info = all_records[field]
@@ -2294,6 +2305,11 @@ async def update(
             for table_field, value_list in changes.multiline_values.items():
                 table_field = PandAName(table_field)
                 table_field = panda_to_epics_name(table_field)
+                if _is_metadata(table_field):
+                    # Multiline metadata such as *METADATA.LAYOUT, which the web GUI
+                    # rewrites whenever a block is moved, is not a table
+                    logging.debug(f"Ignoring {table_field} returned from GetChanges")
+                    continue
                 # Tables must have a MODE record defined - use it to update the table
                 mode_record_name = EpicsName(table_field + ":MODE")
                 if mode_record_name not in all_records:
